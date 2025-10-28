@@ -6,8 +6,15 @@ edition = "2021"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-evdev = "0.12"
+# ★ evdev は 0.12.2 に固定（0.13系だとAPIが変わります）
+evdev = "=0.12.2"
+
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-tempfile = "3"
 
+# WebSocket対応の axum 0.7 系（0.8系では更に変わります）
+axum = { version = "0.7", features = ["ws"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "time", "net"] }
+
+# （任意）エラーを簡単に扱いたいなら
+anyhow = "1"
