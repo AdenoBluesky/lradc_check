@@ -7,6 +7,7 @@ use serde::Serialize;
 use std::{net::SocketAddr, sync::Arc};
 use tokio::{net::TcpListener, sync::{broadcast, Mutex}};
 
+
 #[derive(Clone, Copy, Debug, Default, Serialize, PartialEq, Eq)]
 struct StateBits {
     volume_up: bool,
@@ -63,6 +64,15 @@ async fn client_ws(mut socket: WebSocket, app: AppState) {
     let snap = { *app.latest.lock().await };
     let _ = socket.send(Message::Text(snap.to_json())).await;
 
+    // // // ✅ 最新状態ではなく、全キー released の初期状態を送信
+    // // let snap = StateBits {
+    // //     volume_up: false,
+    // //     volume_down: false,
+    // //     select: false,
+    // //     ok: false,
+    // // };
+    // // let _ = socket.send(Message::Text(snap.to_json())).await;
+
     // 以後はブロードキャスト購読
     let mut rx = app.tx.subscribe();
     while let Ok(bits) = rx.recv().await {
@@ -70,6 +80,22 @@ async fn client_ws(mut socket: WebSocket, app: AppState) {
             break;
         }
     }
+
+    // // --- 現在の最新状態を1回送信 ---
+    // let snap = { *app.latest.lock().await };
+    // let _ = socket.send(Message::Text(snap.to_json())).await;
+
+    // // --- その後、ブロードキャストで更新を待つ ---
+    // let mut rx = app.tx.subscribe();
+
+    // // ✅ 状態変化が起きていなくても、1回強制的に送信する
+    // let _ = socket.send(Message::Text(snap.to_json())).await;
+
+    // while let Ok(bits) = rx.recv().await {
+    //     if socket.send(Message::Text(bits.to_json())).await.is_err() {
+    //         break;
+    //     }
+    // }
 }
 
 async fn evdev_task(dev_path: String, tx: broadcast::Sender<StateBits>, latest: Arc<Mutex<StateBits>>) {
