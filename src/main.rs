@@ -1,12 +1,20 @@
 use axum::{
     extract::ws::{Message, WebSocket, WebSocketUpgrade},
-    extract::State, response::Html, routing::get, Router,
+    extract::State,
+    http::{HeaderMap, HeaderValue, StatusCode},
+    response::{Html, IntoResponse},
+    routing::get,
+    Router,
 };
 use evdev::{Device, InputEventKind, Key};
 use serde::Serialize;
 use std::{net::SocketAddr, sync::Arc};
-use tokio::{net::TcpListener, sync::{broadcast, Mutex}};
-
+use tokio::{
+    net::TcpListener,
+    sync::{broadcast, mpsc, Mutex},
+    task,
+    time::{self, Duration},
+};
 
 #[derive(Clone, Copy, Debug, Default, Serialize, PartialEq, Eq)]
 struct StateBits {
@@ -17,13 +25,15 @@ struct StateBits {
 }
 
 impl StateBits {
-    fn to_json(&self) -> String { serde_json::to_string(self).unwrap() }
+    fn to_json(&self) -> String {
+        serde_json::to_string(self).unwrap()
+    }
 }
 
 #[derive(Clone)]
 struct AppState {
-    tx: broadcast::Sender<StateBits>,
-    latest: Arc<Mutex<StateBits>>,
+    tx: broadcast::Sender<StateBits>,   // WS向け同報チャンネル
+    latest: Arc<Mutex<StateBits>>,      // 直近スナップ（async側のみが更新）
 }
 
 #[tokio::main]
@@ -31,91 +41,135 @@ async fn main() -> anyhow::Result<()> {
     // 引数: [event_path] [bind_addr]
     let mut args = std::env::args().skip(1);
     let dev_path = args.next().unwrap_or("/dev/input/event0".into());
-    let bind: SocketAddr = args.next().unwrap_or("0.0.0.0:8080".into()).parse()?;
+    let bind: SocketAddr = args
+        .next()
+        .unwrap_or("0.0.0.0:8080".into())
+        .parse()?;
 
-    let (tx, _rx) = broadcast::channel::<StateBits>(16);
+    let (tx, _rx0) = broadcast::channel::<StateBits>(32);
     let latest = Arc::new(Mutex::new(StateBits::default()));
     let app_state = AppState { tx: tx.clone(), latest: latest.clone() };
 
-    // evdev 監視タスク
-    tokio::spawn(evdev_task(dev_path, tx, latest));
+    // ブロッキングevdev → async側に橋渡しするMPSC
+    let (ev_tx, mut ev_rx) = mpsc::unbounded_channel::<StateBits>();
 
-    // ルータ
+    // ① ブロッキングI/Oは専用スレッドへ隔離（spawn_blocking）
+    {
+        let dev_path2 = dev_path.clone();
+        let ev_tx2 = ev_tx.clone();
+        task::spawn_blocking(move || {
+            blocking_evdev_loop(dev_path2, ev_tx2);
+        });
+    }
+
+    // ② async側で latest を更新し、broadcast 配信
+    {
+        let app2 = app_state.clone();
+        tokio::spawn(async move {
+            // 任意：ハートビート（無変化でも定期的に再送） 5秒
+            let mut hb = time::interval(Duration::from_secs(5));
+
+            loop {
+                tokio::select! {
+                    // evdevからの新状態
+                    Some(st) = ev_rx.recv() => {
+                        *app2.latest.lock().await = st;
+                        let _ = app2.tx.send(st);
+                    }
+                    // ハートビート：同じ値でも再送（UI生存確認や回線復帰に有効）
+                    _ = hb.tick() => {
+                        let snap = *app2.latest.lock().await;
+                        let _ = app2.tx.send(snap);
+                    }
+                }
+            }
+        });
+    }
+
+    // ③ ルータ
     let app = Router::new()
         .route("/", get(index))
         .route("/ws", get(ws_handler))
+        .route("/state", get(get_state)) // 初期表示やデバッグ用のスナップ取得
+        .route("/favicon.ico", get(|| async { StatusCode::NO_CONTENT }))
         .with_state(app_state);
 
-    // ★ axum 0.7 の起動方法
     let listener = TcpListener::bind(bind).await?;
-    println!("Listening on http://{bind}/  (WS at /ws)");
+    println!("Listening on http://{bind}/ (WS at /ws, snapshot at /state)");
     axum::serve(listener, app).await?;
     Ok(())
 }
 
-async fn index() -> Html<&'static str> { Html(INDEX_HTML) }
+// ---------- HTTP/WS ハンドラ ----------
+
+async fn index() -> impl IntoResponse {
+    let mut h = HeaderMap::new();
+    h.insert("Content-Type", HeaderValue::from_static("text/html; charset=utf-8"));
+    h.insert("Cache-Control", HeaderValue::from_static("no-store"));
+    (h, Html(INDEX_HTML))
+}
+
+async fn get_state(State(app): State<AppState>) -> impl IntoResponse {
+    let snap = *app.latest.lock().await;
+    let mut h = HeaderMap::new();
+    h.insert("Content-Type", HeaderValue::from_static("application/json"));
+    h.insert("Cache-Control", HeaderValue::from_static("no-store"));
+    (h, serde_json::to_string(&snap).unwrap())
+}
 
 async fn ws_handler(ws: WebSocketUpgrade, State(app): State<AppState>) -> axum::response::Response {
     ws.on_upgrade(move |socket| client_ws(socket, app))
 }
 
 async fn client_ws(mut socket: WebSocket, app: AppState) {
-    // 最新値を即送
-    let snap = { *app.latest.lock().await };
-    let _ = socket.send(Message::Text(snap.to_json())).await;
+    // 接続直後は “全 released” を送ってUIを即確定表示（好みで latest に変更可）
+    let initial = StateBits::default();
+    let _ = socket.send(Message::Text(initial.to_json())).await;
 
-    // // // ✅ 最新状態ではなく、全キー released の初期状態を送信
-    // // let snap = StateBits {
-    // //     volume_up: false,
-    // //     volume_down: false,
-    // //     select: false,
-    // //     ok: false,
-    // // };
-    // // let _ = socket.send(Message::Text(snap.to_json())).await;
-
-    // 以後はブロードキャスト購読
+    // 以後は broadcast を受信して都度送信
     let mut rx = app.tx.subscribe();
-    while let Ok(bits) = rx.recv().await {
-        if socket.send(Message::Text(bits.to_json())).await.is_err() {
-            break;
+
+    // Lagged対策：ラグった時は最新スナップを再送
+    loop {
+        match rx.recv().await {
+            Ok(bits) => {
+                if socket.send(Message::Text(bits.to_json())).await.is_err() {
+                    break;
+                }
+            }
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                let snap = *app.latest.lock().await;
+                if socket.send(Message::Text(snap.to_json())).await.is_err() {
+                    break;
+                }
+            }
+            Err(_) => break,
         }
     }
-
-    // // --- 現在の最新状態を1回送信 ---
-    // let snap = { *app.latest.lock().await };
-    // let _ = socket.send(Message::Text(snap.to_json())).await;
-
-    // // --- その後、ブロードキャストで更新を待つ ---
-    // let mut rx = app.tx.subscribe();
-
-    // // ✅ 状態変化が起きていなくても、1回強制的に送信する
-    // let _ = socket.send(Message::Text(snap.to_json())).await;
-
-    // while let Ok(bits) = rx.recv().await {
-    //     if socket.send(Message::Text(bits.to_json())).await.is_err() {
-    //         break;
-    //     }
-    // }
 }
 
-async fn evdev_task(dev_path: String, tx: broadcast::Sender<StateBits>, latest: Arc<Mutex<StateBits>>) {
+// ---------- ブロッキングI/O（専用スレッド） ----------
+
+/// 別スレッドでブロッキングに evdev を監視し、変化時にMPSCで async 側へ渡す。
+fn blocking_evdev_loop(dev_path: String, ev_tx: mpsc::UnboundedSender<StateBits>) {
+    // /dev/input を開く（失敗時は再試行）
     let mut dev = loop {
         match Device::open(&dev_path) {
             Ok(d) => break d,
             Err(e) => {
-                eprintln!("open {} failed: {e}, retry in 1s", dev_path);
-                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                eprintln!("[blocking] open {} failed: {e}, retry in 1s", dev_path);
+                std::thread::sleep(Duration::from_secs(1));
             }
         }
     };
 
     let mut st = StateBits::default();
+
     loop {
         match dev.fetch_events() {
             Ok(events) => {
                 let mut changed = false;
                 for ev in events {
-                    // ★ evdev 0.12.x では InputEventKind が使えます
                     if let InputEventKind::Key(k) = ev.kind() {
                         let pressed = ev.value() == 1 || ev.value() == 2;
                         match k {
@@ -128,23 +182,24 @@ async fn evdev_task(dev_path: String, tx: broadcast::Sender<StateBits>, latest: 
                     }
                 }
                 if changed {
-                    *latest.lock().await = st;
-                    let _ = tx.send(st);
+                    let _ = ev_tx.send(st); // async側へ通知
                 }
             }
             Err(e) => {
-                eprintln!("evdev read error: {e}");
-                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                eprintln!("[blocking] evdev read error: {e}");
+                std::thread::sleep(Duration::from_millis(10));
             }
         }
-        tokio::time::sleep(std::time::Duration::from_millis(3)).await;
+        // busy loop抑止
+        std::thread::sleep(Duration::from_millis(2));
     }
 }
 
-// --- そのまま流用でOK ---
-const INDEX_HTML:&str = r#"<!doctype html>
+// ---------- 埋め込みHTML（WS版UI） ----------
+
+const INDEX_HTML: &str = r#"<!doctype html>
 <meta charset="utf-8">
-<title>LRADC Keys (WebSocket)</title>
+<title>LRADC Keys (WS + blocking evdev isolated)</title>
 <style>
   body{font-family:system-ui,sans-serif;margin:2rem}
   .grid{display:grid;grid-template-columns:repeat(2,160px);gap:16px}
@@ -153,14 +208,16 @@ const INDEX_HTML:&str = r#"<!doctype html>
   .off{background:#fff}
   .name{display:block;font-weight:600;margin-bottom:6px}
   .state{font-size:14px;color:#333}
+  #conn{margin:10px 0;color:#888}
 </style>
-<h1>LRADC Key Status (WS)</h1>
+<h1>LRADC Key Status (WebSocket)</h1>
 <div class="grid">
   <div id="up"     class="key off"><span class="name">VOLUME UP</span><span class="state">…</span></div>
   <div id="down"   class="key off"><span class="name">VOLUME DOWN</span><span class="state">…</span></div>
   <div id="select" class="key off"><span class="name">SELECT</span><span class="state">…</span></div>
   <div id="ok"     class="key off"><span class="name">OK</span><span class="state">…</span></div>
 </div>
+<div id="conn">connecting…</div>
 <script>
 const els = {
   volume_up:  document.getElementById('up'),
@@ -168,6 +225,8 @@ const els = {
   select:     document.getElementById('select'),
   ok:         document.getElementById('ok'),
 };
+const conn = document.getElementById('conn');
+
 function render(s){
   for(const [k,el] of Object.entries(els)){
     const on = !!s[k];
@@ -175,11 +234,14 @@ function render(s){
     el.querySelector('.state').textContent = on ? 'PRESSED' : 'released';
   }
 }
+
 function connect(){
   const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
   const ws = new WebSocket(`${proto}//${location.host}/ws`);
-  ws.onmessage = e => { try{ render(JSON.parse(e.data)); }catch(_){ } };
-  ws.onclose = () => setTimeout(connect, 1000);
+  ws.onopen    = () => conn.textContent = 'connected';
+  ws.onerror   = () => conn.textContent = 'error (will retry)';
+  ws.onclose   = () => { conn.textContent = 'reconnecting…'; setTimeout(connect, 1000); };
+  ws.onmessage = e => { try{ render(JSON.parse(e.data)); }catch(_){} };
 }
 connect();
 </script>
